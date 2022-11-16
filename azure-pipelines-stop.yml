@@ -1,0 +1,86 @@
+trigger: none
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: initialise_values
+    jobs:
+      - job: initialise_values
+        displayName: Initialse PR variables
+        steps:
+        - script: |
+            sourceBranch=$(Build.SourceBranch)
+            echo "== Source branch: $sourceBranch =="
+
+            base_name=devci
+            ci_cache_acr_name="acrdevci"
+            tre_id="tre${base_name}"
+
+            echo "##vso[task.setvariable variable=ci_cache_acr_name;isOutput=true]${ci_cache_acr_name}"
+            echo "##vso[task.setvariable variable=tre_id;isOutput=true]${tre_id}"
+            echo "##vso[task.setvariable variable=mgmt_resource_group;isOutput=true]rg-${tre_id}-mgmt"
+            echo "##vso[task.setvariable variable=mgmt_storage_account;isOutput=true]sa${base_name}"
+            echo "##vso[task.setvariable variable=mgmt_acr;isOutput=true]acr${base_name}"
+
+
+          displayName: 'Generate TRE_ID'
+          name: set_env_values
+
+  - stage: stop_tre
+    dependsOn: initialise_values
+    jobs:
+    - job: tre_stop
+      variables:
+      - group: DEV
+      - name: tre_id
+        value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+      - name: mgmt_resource_group
+        value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+      - name: mgmt_storage_account
+        value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+      - name: mgmt_acr
+        value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+      steps:
+        - script: |
+            set -e
+
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+          displayName: az login
+
+        - task: DevcontainersCi@0
+          displayName: Stop TRE
+          inputs:
+            imageName: ouhtre-deployment-devcontainer
+            # skip image push here as we're just re-using the image rather than building it
+            push: never
+            runCmd: make tre-stop
+            env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  RESOURCE_LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+                  TEST_WORKSPACE_APP_ID=$(WORKSPACE_APP_ID)
+                  TEST_WORKSPACE_APP_SECRET=$(WORKSPACE_APP_SECRET)
+                  IS_API_SECURED=false
+

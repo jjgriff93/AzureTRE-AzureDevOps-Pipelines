@@ -1,0 +1,1255 @@
+trigger:
+  branches:
+    include:
+      - main
+  # PR validation builds are configured via branch protection policy for main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: initialise_values
+    jobs:
+      - job: initialise_values
+        displayName: Initialse PR variables
+        steps:
+        - script: |
+            sourceBranch=$(Build.SourceBranch)
+            echo "== Source branch: $sourceBranch =="
+
+            if [[ "$sourceBranch" == 'refs/heads/main' ]]; then
+              base_name=devci
+              echo "== In main branch (base_name=${base_name}) =="
+            else
+              base_name=$(echo $sourceBranch |shasum | cut -c1-8)
+              echo "== In PR branch (base_name=${base_name}) =="
+            fi
+
+            ci_cache_acr_name="acrdevci"
+            tre_id="tre${base_name}"
+
+            echo "##vso[task.setvariable variable=ci_cache_acr_name;isOutput=true]${ci_cache_acr_name}"
+            echo "##vso[task.setvariable variable=tre_id;isOutput=true]${tre_id}"
+            echo "##vso[task.setvariable variable=mgmt_resource_group;isOutput=true]rg-${tre_id}-mgmt"
+            echo "##vso[task.setvariable variable=mgmt_storage_account;isOutput=true]sa${base_name}"
+            echo "##vso[task.setvariable variable=mgmt_acr;isOutput=true]acr${base_name}"
+
+
+          displayName: 'Generate TRE_ID'
+          name: set_env_values
+
+  - stage: bootstrap
+    dependsOn: initialise_values
+    jobs:
+    - job: bootstrap
+      displayName: Deploy bootstrap resources for PR
+      variables:
+        - group: DEV
+        - name: tre_id
+          value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+        - name: mgmt_resource_group
+          value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+        - name: mgmt_storage_account
+          value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+        - name: mgmt_acr
+          value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+      steps:
+      - script: |
+          echo '== tre_id:               $(tre_id) =='
+          echo '== mgmt_resource_group:  $(mgmt_resource_group) =='
+          echo '== mgmt_storage_account: $(mgmt_storage_account) =='
+          echo '== mgmt_acr:             $(mgmt_acr) =='
+        displayName: Show variables
+
+      - script: |
+          mkdir -p ~/.azure
+        displayName: Fake dev container mounts
+
+      - script: |
+          set -e
+
+          echo "Sign in to az"
+          az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+          echo "Set subscription"
+          az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+          echo "Check if ACR exists"
+          acr_exists=$(az acr show --resource-group $(mgmt_resource_group) --name $(mgmt_acr) > /dev/null 2>&1 ; echo $?)
+          echo "acr_exists: $acr_exists"
+          if [[ "$acr_exists" == 0 ]]; then
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+          else
+            echo "skipping ACR login as ACR not yet created"
+          fi
+        displayName: Attempt to log in to ACR
+
+      - task: DevcontainersCi@0
+        displayName: Show tools versions
+        inputs:
+          imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+          # skip image push here as ACR may not yet exist
+          push: never
+          runCmd: |
+            echo "Terraform version:"
+            terraform --version
+
+            echo
+            echo "Porter version:"
+            porter --version
+
+            echo
+            echo "Porter mixin versions:"
+            porter mixin list
+
+
+          env: |
+            ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+            ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+            ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+            ARM_TENANT_ID=$(ARM_TENANT_ID)
+            AAD_TENANT_ID=$(ARM_TENANT_ID)
+            LOCATION=uksouth
+            TF_VAR_location=uksouth
+            TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+            TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+            TF_VAR_acr_name=$(mgmt_acr)
+            TF_VAR_terraform_state_container_name=tfstate
+            DEBUG="false"
+            TRE_ID=$(tre_id)
+            USE_ENV_VARS_NOT_FILES=true
+            TF_IN_AUTOMATION=true
+
+      - task: DevcontainersCi@0
+        displayName: Run bootstrap
+        inputs:
+          imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+          # skip image push here as ACR may not yet exist
+          push: never
+          runCmd: make bootstrap mgmt-deploy
+          env: |
+            ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+            ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+            ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+            ARM_TENANT_ID=$(ARM_TENANT_ID)
+            AAD_TENANT_ID=$(ARM_TENANT_ID)
+            LOCATION=uksouth
+            TF_VAR_location=uksouth
+            TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+            TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+            TF_VAR_acr_name=$(mgmt_acr)
+            TF_VAR_terraform_state_container_name=tfstate
+            DEBUG="false"
+            TRE_ID=$(tre_id)
+            USE_ENV_VARS_NOT_FILES=true
+            TF_IN_AUTOMATION=true
+
+      - script: |
+          set -e
+
+          success=false
+
+          for i in {1..3}
+          do
+            az acr login --name $(mgmt_acr) && success=true && break || sleep 30
+          done;
+
+          if [[ "$success" == "true" ]]; then
+            echo "Push dev container image"
+            docker push $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+          else
+            echo "Failed!" && exit 1
+          fi
+
+
+        displayName: Authenticate with ACR and push dev container image
+
+  - stage: images
+    dependsOn:
+      - initialise_values
+      - bootstrap
+    jobs:
+      - job: images
+        displayName: Build TRE images
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            api:
+              COMPONENT: api
+            resource-processor:
+              COMPONENT: resource-processor
+            airlock-processor:
+              COMPONENT: airlock-processor
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: DevcontainersCi@0
+          displayName: Build image $(COMPONENT)
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: make build-and-push-$(COMPONENT)
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+
+
+  - stage: deploy_tre
+    dependsOn:
+      - initialise_values
+      - images
+    jobs:
+      - job: deploy_tre
+        displayName: Deploy TRE Core
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: DevcontainersCi@0
+          displayName: Deploy TRE
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: |
+              set -e
+              make deploy-core build-and-deploy-ui-wrapped
+              ./AzureTRE/devops/scripts/api_healthcheck.sh
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_arm_client_id=$(ARM_CLIENT_ID)
+              TF_VAR_arm_client_secret=$(ARM_CLIENT_SECRET)
+              TF_VAR_arm_subscription_id=$(ARM_SUBSCRIPTION_ID)
+              TF_VAR_arm_tenant_id=$(ARM_TENANT_ID)
+              TF_VAR_aad_tenant_id=$(ARM_TENANT_ID)
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              TF_VAR_api_client_id=$(API_CLIENT_ID)
+              TF_VAR_api_client_secret=$(API_CLIENT_SECRET)
+              TF_VAR_application_admin_client_id=$(APPLICATION_ADMIN_CLIENT_ID)
+              TF_VAR_application_admin_client_secret=$(APPLICATION_ADMIN_CLIENT_SECRET)
+              TF_VAR_core_address_space=$(CORE_ADDRESS_SPACE)
+              TF_VAR_tre_address_space=$(TRE_ADDRESS_SPACE)
+              TF_VAR_resource_processor_type=$(RESOURCE_PROCESSOR_TYPE)
+              TF_VAR_api_app_service_plan_sku_size=$(API_APP_SERVICE_PLAN_SKU_SIZE)
+              TF_VAR_enable_airlock_malware_scanning=$(ENABLE_AIRLOCK_MALWARE_SCANNING)
+              TF_VAR_swagger_ui_client_id=$(SWAGGER_UI_CLIENT_ID)
+              TF_VAR_tre_id=$(tre_id)
+              TF_VAR_ci_git_ref=$(Build.SourceBranch)
+              TF_VAR_rp_bundle_values={"image_gallery_id":"$(IMAGE_GALLERY_ID)"}
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+              DEPLOY_UI=true
+              SWAGGER_UI_CLIENT_ID=$(SWAGGER_UI_CLIENT_ID)
+              API_CLIENT_ID=$(API_CLIENT_ID)
+              API_CLIENT_SECRET=$(API_CLIENT_SECRET)
+              LETSENCRYPT_DROP_ALL_RULES=1
+          # LETSENCRYPT_DROP_ALL_RULES=1 to drop all rules on web storage account
+          # (see AzureTRE/templates/core/terraform/scripts/letsencrypt.sh for more info)
+
+
+  - stage: letsencrypt_certs
+    dependsOn:
+      - deploy_tre
+      - initialise_values
+    # only currently using letsencrypt certs on main:
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+    jobs:
+      - job: letsencrypt_certs
+        displayName: Get letsencrypt certs
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: Cache@2
+          # cache letsencrypt folder to avoid re-requesting certs every time
+          inputs:
+            key: '"letsencrypt-$(Build.SourceBranch)"'
+            path: $(Build.SourcesDirectory)/letsencrypt
+
+        - task: DevcontainersCi@0
+          displayName: Run letsencrypt
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: make letsencrypt
+
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_arm_client_id=$(ARM_CLIENT_ID)
+              TF_VAR_arm_client_secret=$(ARM_CLIENT_SECRET)
+              TF_VAR_arm_subscription_id=$(ARM_SUBSCRIPTION_ID)
+              TF_VAR_arm_tenant_id=$(ARM_TENANT_ID)
+              TF_VAR_aad_tenant_id=$(ARM_TENANT_ID)
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              TF_VAR_api_client_id=$(API_CLIENT_ID)
+              TF_VAR_api_client_secret=$(API_CLIENT_SECRET)
+              TF_VAR_application_admin_client_id=$(APPLICATION_ADMIN_CLIENT_ID)
+              TF_VAR_application_admin_client_secret=$(APPLICATION_ADMIN_CLIENT_SECRET)
+              TF_VAR_core_address_space=$(CORE_ADDRESS_SPACE)
+              TF_VAR_tre_address_space=$(TRE_ADDRESS_SPACE)
+              TF_VAR_resource_processor_type=$(RESOURCE_PROCESSOR_TYPE)
+              TF_VAR_api_app_service_plan_sku_size=$(API_APP_SERVICE_PLAN_SKU_SIZE)
+              TF_VAR_enable_airlock_malware_scanning=$(ENABLE_AIRLOCK_MALWARE_SCANNING)
+              TF_VAR_swagger_ui_client_id=$(SWAGGER_UI_CLIENT_ID)
+              TF_VAR_tre_id=$(tre_id)
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+              TF_VAR_ci_git_ref=$(Build.SourceBranch)
+              LETSENCRYPT_DROP_ALL_RULES=1
+          # LETSENCRYPT_DROP_ALL_RULES=1 to drop all rules on web storage account
+          # (see AzureTRE/templates/core/terraform/scripts/letsencrypt.sh for more info)
+
+  - stage: publish_bundles
+    dependsOn:
+      - initialise_values
+      - bootstrap
+    jobs:
+      - job: publish_bundles
+        displayName: Publish workspace bundles
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            base:
+              BUNDLE: "base"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspaces/base"
+            airlock-import-review:
+              BUNDLE: "airlock-import-review"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspaces/airlock-import-review"
+            guacamole:
+              BUNDLE: "guacamole"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/guacamole"
+            azureml:
+              BUNDLE: "azureml"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/azureml"
+            innereye:
+              BUNDLE: "innereye"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/innereye"
+            gitea:
+              BUNDLE: "gitea"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/gitea"
+            mlflow:
+              BUNDLE: "mlflow"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/mlflow"
+            guacamole-azure-windowsvm:
+              BUNDLE: "guacamole-azure-windowsvm"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/templates/workspace_services/guacamole/user_resources/guacamole-azure-windowsvm-ouh"
+            guacamole-azure-linuxvm:
+              BUNDLE: "guacamole-azure-linuxvm"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/templates/workspace_services/guacamole/user_resources/guacamole-azure-linuxvm-ouh"
+            guacamole-azure-import-reviewvm:
+              BUNDLE: "guacamole-azure-import-reviewvm"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/guacamole/user_resources/guacamole-azure-import-reviewvm"
+            guacamole-azure-export-reviewvm:
+              BUNDLE: "guacamole-azure-export-reviewvm"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/guacamole/user_resources/guacamole-azure-export-reviewvm"
+
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: DevcontainersCi@0
+          displayName: Publish bundle $(BUNDLE)
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: |
+              success=
+              for i in {1..3}; do
+                make bundle-build bundle-publish DIR=$(BUNDLE_DIR) && success=true && break || sleep 30
+              done;
+              if [[ -z "$success" ]]; then
+                echo "Failed!" && exit 1
+              fi
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+
+  - stage: publish_shared_bundles
+    dependsOn:
+      - initialise_values
+      - bootstrap
+    jobs:
+      - job: publish_shared_bundles
+        displayName: Publish shared bundles
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            cert:
+                BUNDLE: "certs"
+                BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/shared_services/certs/"
+            firewall:
+                BUNDLE: "firewall"
+                BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/shared_services/firewall/"
+            sonatype-nexus:
+                BUNDLE: "sonatype-nexus"
+                BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/shared_services/sonatype-nexus-vm/"
+            gitea:
+              BUNDLE: "gitea"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/shared_services/gitea/"
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: DevcontainersCi@0
+          displayName: Publish bundle $(BUNDLE)
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: |
+              success=
+              for i in {1..3}; do
+                make bundle-build bundle-publish DIR=$(BUNDLE_DIR) && success=true && break || sleep 30
+              done;
+              if [[ -z "$success" ]]; then
+                echo "Failed!" && exit 1
+              fi
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+
+
+  - stage: register_bundles
+    dependsOn:
+      - initialise_values
+      - publish_bundles
+      - deploy_tre
+    jobs:
+      - job: register_bundles
+        displayName: Register bundles
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            base:
+              BUNDLE: "base"
+              BUNDLE_TYPE: "workspace"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspaces/base"
+            airlock-import-review:
+              BUNDLE: "airlock-import-review"
+              BUNDLE_TYPE: "workspace"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspaces/airlock-import-review"
+            guacamole:
+              BUNDLE: "guacamole"
+              BUNDLE_TYPE: "workspace_service"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/guacamole"
+            azureml:
+              BUNDLE: "azureml"
+              BUNDLE_TYPE: "workspace_service"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/azureml"
+            innereye:
+              BUNDLE: "innereye"
+              BUNDLE_TYPE: "workspace_service"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/innereye"
+            gitea:
+              BUNDLE: "gitea"
+              BUNDLE_TYPE: "workspace_service"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/gitea"
+            mlflow:
+              BUNDLE: "mlflow"
+              BUNDLE_TYPE: "workspace_service"
+              BUNDLE_DIR: "/workspaces/ouhtre_deployment/AzureTRE/templates/workspace_services/mlflow"
+
+        steps:
+        - script: |
+            mkdir -p ~/.azure
+          displayName: Fake dev container mounts
+
+        - script: |
+            set -e
+            echo "Sign in to az"
+            az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+            echo "Set subscription"
+            az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+
+            echo "Log in to ACR ($(mgmt_acr))"
+            az acr login --name $(mgmt_acr)
+
+          displayName: Log in to ACR (for pulling dev container image)
+
+        - task: DevcontainersCi@0
+          displayName: Register bundle $(BUNDLE)
+          inputs:
+            imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+            # skip image push here as already pushed in bootstrap job
+            push: never
+            runCmd: |
+              make bundle-register DIR=$(BUNDLE_DIR)
+
+            env: |
+              ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+              ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+              ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+              ARM_TENANT_ID=$(ARM_TENANT_ID)
+              AAD_TENANT_ID=$(ARM_TENANT_ID)
+              LOCATION=uksouth
+              TF_VAR_location=uksouth
+              TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+              TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+              TF_VAR_acr_name=$(mgmt_acr)
+              TF_VAR_terraform_state_container_name=tfstate
+              DEBUG="false"
+              TRE_ID=$(tre_id)
+              USE_ENV_VARS_NOT_FILES=true
+              TF_IN_AUTOMATION=true
+              ACR_NAME=$(MGMT_ACR)
+              BUNDLE_TYPE=$(BUNDLE_TYPE)
+              API_CLIENT_ID=$(API_CLIENT_ID)
+              TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+              TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+              CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+
+  - stage: register_shared_bundles
+    dependsOn:
+      - initialise_values
+      - publish_shared_bundles
+      - deploy_tre
+    jobs:
+      - job: register_shared_bundles
+        displayName: Register shared bundles
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            certs:
+              BUNDLE: "shared_service"
+              BUNDLE_TYPE: "shared_service"
+              BUNDLE_DIR: "./AzureTRE/templates/shared_services/certs"
+            firewall:
+              BUNDLE: "shared_service"
+              BUNDLE_TYPE: "shared_service"
+              BUNDLE_DIR: "./AzureTRE/templates/shared_services/firewall" # Full file path or shortened?
+            sonatype-nexus:
+              BUNDLE: "shared_service"
+              BUNDLE_TYPE: "shared_service"
+              BUNDLE_DIR: "./AzureTRE/templates/shared_services/sonatype-nexus-vm"
+            gitea:
+              BUNDLE: "shared_service"
+              BUNDLE_TYPE: "shared_service"
+              BUNDLE_DIR: "./AzureTRE/templates/shared_services/gitea"
+        steps:
+            - script: |
+                mkdir -p ~/.azure
+              displayName: Fake dev container mounts
+            - script: |
+                set -e
+                echo "Sign in to az"
+                az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                echo "Set subscription"
+                az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+                echo "Log in to ACR ($(mgmt_acr))"
+                az acr login --name $(mgmt_acr)
+              displayName: Log in to ACR (for pulling dev container image)
+            - task: DevcontainersCi@0
+              displayName: Register bundle $(BUNDLE)
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: |
+                    make bundle-register DIR=$(BUNDLE_DIR)
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  TF_VAR_tre_id=$(tre_id)
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  BUNDLE_TYPE=$(BUNDLE_TYPE)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+
+  - stage: register_user_resource_bundles
+    dependsOn:
+      - initialise_values
+      - register_bundles
+      - publish_bundles
+      - deploy_tre
+    jobs:
+      - job: register_user_resource_bundles
+        displayName: Register user-resource bundles
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        strategy:
+          matrix:
+            guacamole-azure-windowsvm:
+              BUNDLE: "guacamole-azure-windowsvm"
+              BUNDLE_TYPE: "user_resource"
+              BUNDLE_DIR: "./templates/workspace_services/guacamole/user_resources/guacamole-azure-windowsvm-ouh"
+              WORKSPACE_SERVICE_NAME: "tre-service-guacamole"
+            guacamole-azure-linuxvm:
+              BUNDLE: "guacamole-azure-linuxvm"
+              BUNDLE_TYPE: "user_resource"
+              BUNDLE_DIR: "./templates/workspace_services/guacamole/user_resources/guacamole-azure-linuxvm-ouh"
+              WORKSPACE_SERVICE_NAME: "tre-service-guacamole"
+            guacamole-azure-import-reviewvm:
+              BUNDLE: "guacamole-azure-import-reviewvm"
+              BUNDLE_TYPE: "user_resource"
+              BUNDLE_DIR: "./AzureTRE/templates/workspace_services/guacamole/user_resources/guacamole-azure-import-reviewvm"
+              WORKSPACE_SERVICE_NAME: "tre-service-guacamole"
+            guacamole-azure-export-reviewvm:
+              BUNDLE: "guacamole-azure-export-reviewvm"
+              BUNDLE_TYPE: "user_resource"
+              BUNDLE_DIR: "./AzureTRE/templates/workspace_services/guacamole/user_resources/guacamole-azure-export-reviewvm"
+              WORKSPACE_SERVICE_NAME: "tre-service-guacamole"
+        steps:
+            - script: |
+                mkdir -p ~/.azure
+              displayName: Fake dev container mounts
+            - script: |
+                set -e
+                echo "Sign in to az"
+                az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                echo "Set subscription"
+                az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+                echo "Log in to ACR ($(mgmt_acr))"
+                az acr login --name $(mgmt_acr)
+              displayName: Log in to ACR (for pulling dev container image)
+            - task: DevcontainersCi@0
+              displayName: Register bundle $(BUNDLE)
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: |
+                    make bundle-register  DIR=$(BUNDLE_DIR) BUNDLE_TYPE=$(BUNDLE_TYPE) WORKSPACE_SERVICE_NAME=$(WORKSPACE_SERVICE_NAME)
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+
+  - stage: deploy_shared_services
+    dependsOn:
+      - initialise_values
+      - register_shared_bundles
+      - deploy_tre
+    jobs:
+      - job: deploy_shared_services
+        displayName: Deploy shared services
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        steps:
+            - script: |
+                mkdir -p ~/.azure
+              displayName: Fake dev container mounts
+            - script: |
+                set -e
+                echo "Sign in to az"
+                az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                echo "Set subscription"
+                az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+                echo "Log in to ACR ($(mgmt_acr))"
+                az acr login --name $(mgmt_acr)
+              displayName: Log in to ACR (for pulling dev container image)
+
+            - task: DevcontainersCi@0
+              displayName: Deploy firewall shared service
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: make deploy-shared-service DIR=./AzureTRE/templates/shared_services/firewall/ BUNDLE_TYPE=shared_service
+
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+
+            - task: DevcontainersCi@0
+              displayName: Deploy certs service
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: make deploy-shared-service DIR=./AzureTRE/templates/shared_services/certs/ BUNDLE_TYPE=shared_service PROPS="--domain_prefix nexus --cert_name nexus-ssl"
+
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+
+            - task: DevcontainersCi@0
+              displayName: Deploy nexus shared service
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: make deploy-shared-service DIR=./AzureTRE/templates/shared_services/sonatype-nexus-vm/ BUNDLE_TYPE=shared_service PROPS="--ssl_cert_name nexus-ssl"
+
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+
+
+            - task: DevcontainersCi@0
+              displayName: State Store Migrations
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                push: never
+                runCmd: make db-migrate
+
+
+                env: |
+                  ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                  ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                  ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                  ARM_TENANT_ID=$(ARM_TENANT_ID)
+                  AAD_TENANT_ID=$(ARM_TENANT_ID)
+                  LOCATION=uksouth
+                  TF_VAR_location=uksouth
+                  TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                  TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                  TF_VAR_acr_name=$(mgmt_acr)
+                  TF_VAR_terraform_state_container_name=tfstate
+                  DEBUG="false"
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  TRE_ID=$(tre_id)
+                  USE_ENV_VARS_NOT_FILES=true
+                  TF_IN_AUTOMATION=true
+                  ACR_NAME=$(MGMT_ACR)
+                  CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                  API_CLIENT_ID=$(API_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                  TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+                  TF_VAR_core_address_space=$(CORE_ADDRESS_SPACE)
+                  TF_VAR_tre_address_space=$(TRE_ADDRESS_SPACE)
+                  TF_VAR_swagger_ui_client_id=$(SWAGGER_UI_CLIENT_ID)
+                  TF_VAR_api_client_id=$(API_CLIENT_ID)
+                  TF_VAR_api_client_secret=$(API_CLIENT_SECRET)
+                  TEST_WORKSPACE_APP_ID=$(TEST_WORKSPACE_APP_ID)
+                  TEST_WORKSPACE_APP_SECRET=$(TEST_WORKSPACE_APP_SECRET)
+
+
+  - stage: e2e_tests_smoke
+    dependsOn:
+      - initialise_values
+      - deploy_shared_services
+      - register_bundles
+    jobs:
+      - job: e2e_tests_smoke
+        displayName: Run E2E Tests (Smoke)
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        steps:
+            - script: |
+                mkdir -p ~/.azure
+              displayName: Fake dev container mounts
+            - script: |
+                set -e
+                echo "Sign in to az"
+                az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                echo "Set subscription"
+                az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+                echo "Log in to ACR ($(mgmt_acr))"
+                az acr login --name $(mgmt_acr)
+              displayName: Log in to ACR (for pulling dev container image)
+            - task: DevcontainersCi@0
+              displayName: Run E2E Tests (Smoke)
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                # skip image push here as already pushed in bootstrap job
+                # Change to AzureTRE folder to run upstream e2e_tests
+                push: never
+                runCmd: |
+                  set -e
+                  cd AzureTRE
+                  pip install -r ./requirements.txt
+                  make test-e2e-smoke
+
+                env: |
+                      ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                      ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                      ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                      ARM_TENANT_ID=$(ARM_TENANT_ID)
+                      AAD_TENANT_ID=$(ARM_TENANT_ID)
+                      LOCATION=uksouth
+                      RESOURCE_LOCATION=uksouth
+                      TF_VAR_location=uksouth
+                      TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                      TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                      TF_VAR_acr_name=$(mgmt_acr)
+                      TF_VAR_terraform_state_container_name=tfstate
+                      DEBUG="false"
+                      TRE_ID=$(tre_id)
+                      USE_ENV_VARS_NOT_FILES=true
+                      TF_IN_AUTOMATION=true
+                      ACR_NAME=$(MGMT_ACR)
+                      CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                      API_CLIENT_ID=$(API_CLIENT_ID)
+                      TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                      TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+                      TEST_WORKSPACE_APP_ID=$(WORKSPACE_APP_ID)
+                      TEST_WORKSPACE_APP_SECRET=$(WORKSPACE_APP_SECRET)
+                      IS_API_SECURED=false
+
+  - stage: stop_tre
+    dependsOn:
+      - initialise_values
+      - e2e_tests_smoke
+      - register_user_resource_bundles
+      - letsencrypt_certs
+    jobs:
+      - job: stop_tre
+        displayName: Stop TRE
+        variables:
+          - group: DEV
+          - name: tre_id
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.tre_id'] ]
+          - name: mgmt_resource_group
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_resource_group'] ]
+          - name: mgmt_storage_account
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_storage_account'] ]
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+          - name: ci_cache_acr_name
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.ci_cache_acr_name'] ]
+        steps:
+            - script: |
+                mkdir -p ~/.azure
+              displayName: Fake dev container mounts
+            - script: |
+                set -e
+                echo "Sign in to az"
+                az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+                echo "Set subscription"
+                az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+                echo "Log in to ACR ($(mgmt_acr))"
+                az acr login --name $(mgmt_acr)
+              displayName: Log in to ACR (for pulling dev container image)
+            - task: DevcontainersCi@0
+              displayName: Stop TRE running
+              inputs:
+                imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+                push: never
+                runCmd: |
+                  make tre-stop
+
+                env: |
+                      ARM_CLIENT_ID=$(ARM_CLIENT_ID)
+                      ARM_CLIENT_SECRET=$(ARM_CLIENT_SECRET)
+                      ARM_SUBSCRIPTION_ID=$(ARM_SUBSCRIPTION_ID)
+                      ARM_TENANT_ID=$(ARM_TENANT_ID)
+                      AAD_TENANT_ID=$(ARM_TENANT_ID)
+                      LOCATION=uksouth
+                      RESOURCE_LOCATION=uksouth
+                      TF_VAR_location=uksouth
+                      TF_VAR_mgmt_resource_group_name=$(mgmt_resource_group)
+                      TF_VAR_mgmt_storage_account_name=$(mgmt_storage_account)
+                      TF_VAR_acr_name=$(mgmt_acr)
+                      TF_VAR_terraform_state_container_name=tfstate
+                      DEBUG="false"
+                      TRE_ID=$(tre_id)
+                      USE_ENV_VARS_NOT_FILES=true
+                      TF_IN_AUTOMATION=true
+                      ACR_NAME=$(MGMT_ACR)
+                      CI_CACHE_ACR_NAME=$(ci_cache_acr_name)
+                      API_CLIENT_ID=$(API_CLIENT_ID)
+                      TEST_ACCOUNT_CLIENT_ID=$(TEST_ACCOUNT_CLIENT_ID)
+                      TEST_ACCOUNT_CLIENT_SECRET=$(TEST_ACCOUNT_CLIENT_SECRET)
+                      TEST_WORKSPACE_APP_ID=$(WORKSPACE_APP_ID)
+                      TEST_WORKSPACE_APP_SECRET=$(WORKSPACE_APP_SECRET)
+                      IS_API_SECURED=false
+
+  - stage: deploy_artifact
+    dependsOn:
+      - initialise_values
+      - e2e_tests_smoke
+    jobs:
+      - job: build_artifact
+        displayName: Build artifacts for PROD
+        variables:
+          - group: DEV
+          - name: mgmt_acr
+            value: $[ stageDependencies.initialise_values.initialise_values.outputs['set_env_values.mgmt_acr'] ]
+
+        steps:
+          - script: |
+              set -e
+              echo "Sign in to az"
+              az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+              echo "Set subscription"
+              az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+            displayName: az login
+
+          - script: |
+              mkdir -p ~/.azure
+            displayName: Fake dev container mounts
+
+          - script: |
+              set -e
+              echo "Sign in to az"
+              az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+              echo "Set subscription"
+              az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+              echo "Log in to ACR ($(mgmt_acr))"
+              az acr login --name $(mgmt_acr)
+            displayName: Log in to ACR (for pulling dev container image)
+
+          - task: DevcontainersCi@0
+            displayName: Zip source folder
+            inputs:
+              imageName: $(mgmt_acr).azurecr.io/ouhtre-deployment-devcontainer
+              push: never
+              runCmd: |
+                zip -r source.zip .
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              path: '$(Build.SourcesDirectory)/source.zip'
+              artifactName: 'DEV_build'
+              publishLocation: 'pipeline'
+
+          - script: |
+                cd ./$(Build.ArtifactStagingDirectory)
+                echo "listing content of staging dir: $(Build.ArtifactStagingDirectory)"
+                ls -la
+            displayName: listing dir contents

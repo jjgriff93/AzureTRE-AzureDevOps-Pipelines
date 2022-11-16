@@ -1,0 +1,37 @@
+trigger: none
+pr: none
+schedules:
+  - cron: 0 */6 * * *
+    branches:
+      include:
+        - main
+
+pool:
+  vmImage: ubuntu-latest
+
+jobs:
+  - job: pr_cleanup
+    variables:
+    - group: DEV
+
+    steps:
+      - script: |
+          set -e
+
+          echo "Sign in to az"
+          az login --service-principal --user "$(ARM_CLIENT_ID)" --password "$(ARM_CLIENT_SECRET)" --tenant "$(ARM_TENANT_ID)"
+
+          echo "Set subscription"
+          az account set --subscription "$(ARM_SUBSCRIPTION_ID)"
+        displayName: az login
+
+      # TODO - once main build creates bootstrap (specifically ACR), add ACR login and dev container image caching
+      - task: DevcontainersCi@0
+        displayName: Run cleanup
+        inputs:
+          imageName: ouhtre-deployment-devcontainer
+          # skip image push here as ACR may not yet exist
+          push: never
+          runCmd: ./devops/scripts/pr-env-cleanup.sh
+          env: |
+            AZURE_DEVOPS_EXT_PAT=$(System.AccessToken)
